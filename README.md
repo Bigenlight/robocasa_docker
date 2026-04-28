@@ -50,6 +50,99 @@ RoboCasa works across all major computing platforms. The easiest way to set up i
    ```
 
 -------
+## Docker (recommended for headless eval / shareable setup)
+
+This fork ships a Docker workflow that lets a fresh machine run a RoboCasa
+rollout (sim + headless render → mp4) without installing **anything** on the
+host beyond Docker and the NVIDIA Container Toolkit. The image bakes only pip
+dependencies; the robocasa source, robosuite source, asset directory, and
+outputs all live on the host and are bind-mounted at runtime.
+
+See [`DOCKER.md`](DOCKER.md) for the full design notes and what changed.
+
+### One-time host setup
+
+```sh
+cd robocasa_docker
+
+# robosuite (master branch — same instruction as conda install above, just
+# placed here so the container can bind-mount it).
+git clone https://github.com/ARISE-Initiative/robosuite ./robosuite
+
+# Build the image (~8GB, takes a few minutes — CUDA 12.1 base layer is the bulk).
+./run.sh --build
+
+# Download kitchen assets (~10GB, one-time). Lands in robocasa/models/assets/
+# on the host so it persists across container restarts.
+./run.sh --download-assets
+```
+
+### Run the smoke test
+
+```sh
+./run.sh --smoke-test
+```
+
+Six steps run inside the container:
+1. import sanity (numpy / mujoco / robosuite / robocasa paths)
+2. render-backend probe (creates a tiny `mujoco.Renderer` to confirm `MUJOCO_GL` works)
+3. `gym.make("robocasa/PickPlaceCounterToSink", split="pretrain")` + `reset()`
+4. PNG render of the agentview camera → `test_outputs/smoke_agentview.png`
+5. 10 random sim steps (no crash, reward/done shape correct)
+6. `run_random_rollouts(num_rollouts=1, num_steps=30)` → `test_outputs/smoke_PickPlaceCounterToSink.mp4`
+
+If EGL fails (no GPU passthrough, missing driver caps, etc.), `run.sh`
+automatically retries the same test with `MUJOCO_GL=osmesa`.
+
+### Run an arbitrary task rollout
+
+```sh
+./run.sh --rollout TurnOnMicrowave --num 1 --steps 60 --seed 0
+# writes test_outputs/TurnOnMicrowave_seed0.mp4
+```
+
+Some good headless-friendly task names to try (all of these are real
+gym ids registered as `robocasa/<TaskName>`):
+
+- pick & place: `PickPlaceCounterToSink`, `PickPlaceCounterToStove`,
+  `PickPlaceCounterToCabinet`, `PickPlaceCounterToMicrowave`,
+  `PickPlaceMicrowaveToCounter`, `PickPlaceSinkToCounter`,
+  `PickPlaceStoveToCounter`
+- atomic: `OpenCabinet`, `CloseCabinet`, `OpenDoor`, `CloseDoor`,
+  `OpenDrawer`, `CloseDrawer`, `TurnOnMicrowave`, `TurnOffMicrowave`,
+  `TurnOnStove`, `TurnOffStove`, `TurnOnSinkFaucet`
+
+396 robocasa tasks total — list them all inside the container:
+`./run.sh --shell` then `python -c "import robocasa, gymnasium as gym; print('\n'.join(sorted(s for s in gym.envs.registry if s.startswith('robocasa/'))))"`
+
+### Interactive shell
+
+```sh
+./run.sh --shell
+# inside: python -c "import robocasa, gymnasium as gym; print(robocasa.__version__)"
+```
+
+### Image / container conventions
+
+- Image tag: `robocasa-eval:latest` (override with `ROBOCASA_IMAGE=...`).
+- Container runs as your host UID/GID — files written into the bind mounts
+  (downloaded zips, mp4s, `macros_private.py`) are owned by you, not root.
+- `MUJOCO_GL=egl` by default; `run.sh` retries with `osmesa` on failure.
+- `--gpus all` is added automatically when `nvidia-smi` is detected on the host.
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `ModuleNotFoundError: robosuite` | `./robosuite/` not cloned | `git clone https://github.com/ARISE-Initiative/robosuite ./robosuite` |
+| Empty `test_outputs/` after smoke test | EGL probe failed silently and OSMesa fallback also failed | Check `nvidia-smi` on host, ensure `nvidia-container-toolkit` is installed and `docker info` lists `nvidia` runtime |
+| `KeyError: 'robot0_agentview_center'` | You're calling `sim.render(camera_name="robot0_agentview_center")` — the gym wrapper only registers `robot0_agentview_{left,right}` and `robot0_eye_in_hand` | Use `robot0_agentview_left` (default in our scripts) |
+| `AttributeError: 'OrderEnforcing' object has no attribute 'sim'` | gymnasium 1.x removed `Wrapper.__getattr__` | The Dockerfile pins `gymnasium==0.29.1` — make sure you didn't override that |
+| Pip can't satisfy `numpy==2.2.5` | A transitive dep (often older `lerobot`/`tianshou`) is force-pinning `numpy<2` | We install those `--no-deps` already; do the same in any downstream image |
+| `download_kitchen_assets.py` hangs at "Proceed? (y/n)" | Stdin not piped through to the container | Use `./run.sh --download-assets` (it pipes `yes y \| ...`); don't invoke the script directly with `docker run` |
+| Files in `test_outputs/` owned by root | `--user` flag missing | `run.sh` adds it automatically; if you wrote your own invocation, add `--user $(id -u):$(id -g)` and `-e HOME=/tmp/robocasa-home` |
+
+-------
 ## Basic Usage
 
 ### Gym wrapper

@@ -1,0 +1,5 @@
+# The Dockerfile does no COPY of project source — robocasa, robosuite,
+# examples, tests are bind-mounted at runtime. Keep the build context tiny.
+*
+!Dockerfile
+!.dockerignore

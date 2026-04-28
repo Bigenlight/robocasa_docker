@@ -168,3 +168,13 @@ robocasa/scripts/taskgen/task_prompting/outputs/
 
 # Always ignore macOS junk
 **/.DS_Store
+
+# ── Docker eval workflow ─────────────────────────────────
+# robosuite is host-cloned for bind-mounting into the container, not tracked.
+robosuite/
+# mp4 / png outputs from container runs.
+test_outputs/
+# attribution README that ships inside the objaverse asset zip — not a
+# source-tracked file; it lands here only after `./run.sh --download-assets`.
+robocasa/models/assets/README.md
+
