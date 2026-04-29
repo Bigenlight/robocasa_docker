@@ -36,6 +36,10 @@ ROLLOUT_TASK="$DEFAULT_TASK"
 ROLLOUT_STEPS=60
 ROLLOUT_NUM=1
 ROLLOUT_SEED=0
+ROLLOUT_SEED_BASE=0
+ROLLOUT_MAX_STEPS=""
+ROLLOUT_REPLAY_CHUNK=""
+GROOT_SERVER="${GROOT_SERVER:-http://localhost:8500}"
 EXTRA_DOCKER_ARGS=""
 
 usage() {
@@ -50,9 +54,26 @@ Usage:
         --seed N         seed (default ${ROLLOUT_SEED})
   ./run.sh --shell                        # interactive bash
   ./run.sh --build                        # docker build the image
+  ./run.sh --groot-eval <Task> [opts]     # run an eval against the GR00T HTTP server
+        --steps N        rollout length (default ${ROLLOUT_STEPS})
+        --seed N         seed (default ${ROLLOUT_SEED})
+        (set GROOT_SERVER=http://host:port to override; default localhost:8500)
+  ./run.sh --canonical-eval <Task> [opts]
+        Canonical Isaac-GR00T eval pipeline:
+          - n_action_steps=16 full chunk replay
+          - per-task horizon from get_task_horizon(<Task>)
+          - 5-state, 5-action-subkey, 3-camera contract (matches metadata.json)
+          - split=pretrain (multitask checkpoint kitchens)
+          - emits N mp4s + groot_<Task>_summary.json
+        Options:
+          --num-rollouts N   number of trials (default 1)
+          --seed-base N      first trial seed (default 0); seeds are base..base+N-1
+          --max-steps N      override per-task horizon
+          --replay-chunk N   override full-chunk replay (1 = closed-loop)
 
 Environment:
   ROBOCASA_IMAGE   override image tag (default: robocasa-eval:latest)
+  GROOT_SERVER     URL of the GR00T HTTP server for --groot-eval mode
 USAGE
 }
 
@@ -62,11 +83,17 @@ while [[ $# -gt 0 ]]; do
         --smoke-test)         MODE="smoke"; shift ;;
         --download-assets)    MODE="assets"; shift ;;
         --rollout)            MODE="rollout"; ROLLOUT_TASK="$2"; shift 2 ;;
+        --groot-eval)         MODE="groot-eval"; ROLLOUT_TASK="$2"; shift 2 ;;
+        --canonical-eval)     MODE="canonical-eval"; ROLLOUT_TASK="$2"; shift 2 ;;
         --shell)              MODE="shell"; shift ;;
         --build)              MODE="build"; shift ;;
         --steps)              ROLLOUT_STEPS="$2"; shift 2 ;;
         --num)                ROLLOUT_NUM="$2"; shift 2 ;;
-        --seed)               ROLLOUT_SEED="$2"; shift 2 ;;
+        --num-rollouts)       ROLLOUT_NUM="$2"; shift 2 ;;
+        --seed)               ROLLOUT_SEED="$2"; ROLLOUT_SEED_BASE="$2"; shift 2 ;;
+        --seed-base)          ROLLOUT_SEED_BASE="$2"; shift 2 ;;
+        --max-steps)          ROLLOUT_MAX_STEPS="$2"; shift 2 ;;
+        --replay-chunk)       ROLLOUT_REPLAY_CHUNK="$2"; shift 2 ;;
         -h|--help)            usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
@@ -223,6 +250,63 @@ python /workspace/robocasa/test_smoke.py --output-dir /workspace/robocasa/test_o
             fi
         fi
         echo "Outputs: $OUTPUT_DIR"
+        ;;
+
+    groot-eval)
+        echo "=== GR00T eval: $ROLLOUT_TASK (${ROLLOUT_STEPS} steps, seed=${ROLLOUT_SEED}) ==="
+        echo "  GR00T server: $GROOT_SERVER"
+        VIDEO_NAME="groot_${ROLLOUT_TASK}_seed${ROLLOUT_SEED}.mp4"
+        # --network host so http://localhost:8500 reaches the GR00T container
+        # (which also runs with --network host).
+        docker run "${COMMON_RUN_ARGS[@]}" \
+            --network host \
+            -e MUJOCO_GL=egl \
+            -e GROOT_SERVER="$GROOT_SERVER" \
+            "$IMAGE" \
+            bash -c "$PREAMBLE
+python /workspace/robocasa/examples/run_groot_eval.py \
+    --task '$ROLLOUT_TASK' \
+    --num-steps $ROLLOUT_STEPS \
+    --seed $ROLLOUT_SEED \
+    --server '$GROOT_SERVER' \
+    --video /workspace/robocasa/test_outputs/$VIDEO_NAME"
+        echo ""
+        echo "Video: $OUTPUT_DIR/$VIDEO_NAME"
+        ;;
+
+    canonical-eval)
+        echo "=== Canonical GR00T eval: $ROLLOUT_TASK ==="
+        echo "  num_rollouts=${ROLLOUT_NUM}  seed_base=${ROLLOUT_SEED_BASE}"
+        echo "  max_steps=${ROLLOUT_MAX_STEPS:-<auto get_task_horizon>}"
+        echo "  replay_chunk=${ROLLOUT_REPLAY_CHUNK:-<auto full-chunk>}"
+        echo "  GR00T server: $GROOT_SERVER"
+        EXTRA_ARGS=""
+        if [[ -n "$ROLLOUT_MAX_STEPS" ]]; then
+            EXTRA_ARGS="$EXTRA_ARGS --max-steps $ROLLOUT_MAX_STEPS"
+        fi
+        if [[ -n "$ROLLOUT_REPLAY_CHUNK" ]]; then
+            EXTRA_ARGS="$EXTRA_ARGS --replay-chunk $ROLLOUT_REPLAY_CHUNK"
+        fi
+        # --network host so http://localhost:8500 reaches the GR00T container
+        # (which also runs with --network host).
+        docker run "${COMMON_RUN_ARGS[@]}" \
+            --network host \
+            -e MUJOCO_GL=egl \
+            -e GROOT_SERVER="$GROOT_SERVER" \
+            "$IMAGE" \
+            bash -c "$PREAMBLE
+python /workspace/robocasa/examples/run_groot_eval.py \
+    --task '$ROLLOUT_TASK' \
+    --split pretrain \
+    --num-rollouts $ROLLOUT_NUM \
+    --seed-base $ROLLOUT_SEED_BASE \
+    --server '$GROOT_SERVER' \
+    --output-dir /workspace/robocasa/test_outputs \
+    $EXTRA_ARGS"
+        echo ""
+        echo "Per-trial mp4s + summary.json in: $OUTPUT_DIR"
+        echo "  Look for: groot_<Task>_seed<N>_success<0|1>.mp4"
+        echo "            groot_<Task>_summary.json"
         ;;
 
     rollout)
