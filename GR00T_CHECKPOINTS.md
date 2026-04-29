@@ -264,6 +264,81 @@ rollouts look like.
 
 ---
 
+## 7.1. Local storage layout (where the files actually go)
+
+After `huggingface-cli download ... --local-dir /groot/checkpoint`, files land at:
+
+```
+robocasa_docker/groot_docker_n1.5/checkpoint/
+├── gr00t_n1-5/
+│   ├── multitask_learning/checkpoint-120000/                              (recipe A — real files)
+│   ├── foundation_model_learning/target_posttraining/composite_seen/checkpoint-60000/  (recipe B)
+│   └── ... (any other recipes you've downloaded)
+├── config.json                                       (symlink → ONE active recipe)
+├── experiment_cfg                                    (symlink → ONE active recipe)
+├── model-00001-of-00002.safetensors                  (symlink → ONE active recipe)
+├── model-00002-of-00002.safetensors                  (symlink → ONE active recipe)
+└── model.safetensors.index.json                      (symlink → ONE active recipe)
+```
+
+The 5 root-level symlinks are how the server picks weights — `groot_docker_n1.5/run.sh:181` bind-mounts `checkpoint/:/groot/checkpoint:ro` and `serve_groot.py` reads `/groot/checkpoint/config.json`, `/groot/checkpoint/experiment_cfg/metadata.json`, etc. **Switching active recipe = repointing those 5 symlinks** (which is what `swap_ckpt.sh` does).
+
+You can have arbitrarily many recipes coexisting under `gr00t_n1-5/`; only one is "active" at a time.
+
+Disk usage: ~7.1 GB per recipe (without optimizer.pt) or ~16 GB with it. Check the active recipe at any time:
+
+```sh
+cd robocasa_docker/groot_docker_n1.5
+./swap_ckpt.sh --current
+```
+
+---
+
+## 7.2. Download any recipe + activate it
+
+`groot_docker_n1.5/run.sh --download-ckpt` is hardcoded to the multitask recipe (the default for getting started). For any other recipe, run a one-shot docker container that calls huggingface-cli with the right `--include`. Generic pattern:
+
+```sh
+cd robocasa_docker/groot_docker_n1.5
+RECIPE_PATH="gr00t_n1-5/foundation_model_learning/target_posttraining/composite_seen/checkpoint-60000"
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp/groot-home \
+    -v "$PWD/checkpoint:/groot/checkpoint" \
+    -v "$HOME/.cache/huggingface:/tmp/groot-home/.cache/huggingface" \
+    groot-server:latest \
+    bash -c "mkdir -p /tmp/groot-home && \
+        huggingface-cli download robocasa/robocasa365_checkpoints \
+            --include '${RECIPE_PATH}/*' \
+            --exclude '*optimizer*' \
+            --local-dir /groot/checkpoint"
+```
+
+After the download finishes, point the active symlinks at it:
+
+```sh
+./run.sh --stop                           # stop server before swapping
+./swap_ckpt.sh target_pt_composite_seen   # repoint symlinks (12 recipe names available)
+./run.sh --serve-bg                       # start server with new weights
+curl http://localhost:8500/health         # confirm: model + n_action_steps
+```
+
+Recipe names accepted by `swap_ckpt.sh`:
+
+| Recipe alias | HF subpath |
+|---|---|
+| `multitask` | `gr00t_n1-5/multitask_learning/checkpoint-120000` |
+| `pretraining` | `gr00t_n1-5/foundation_model_learning/pretraining/checkpoint-80000` |
+| `target_only_atomic` | `gr00t_n1-5/foundation_model_learning/target_only/atomic_seen/checkpoint-60000` |
+| `target_only_composite_seen` | `gr00t_n1-5/foundation_model_learning/target_only/composite_seen/checkpoint-60000` |
+| `target_only_composite_unseen` | `gr00t_n1-5/foundation_model_learning/target_only/composite_unseen/checkpoint-60000` |
+| `target_pt_atomic` | `gr00t_n1-5/foundation_model_learning/target_posttraining/atomic_seen/checkpoint-60000` |
+| `target_pt_composite_seen` | `gr00t_n1-5/foundation_model_learning/target_posttraining/composite_seen/checkpoint-60000` |
+| `target_pt_composite_unseen` | `gr00t_n1-5/foundation_model_learning/target_posttraining/composite_unseen/checkpoint-60000` |
+| `lifelong_phase1`..`lifelong_phase4` | `gr00t_n1-5/lifelong_learning/phase{1..4}/checkpoint-{100000\|60000}` |
+
+Run `./swap_ckpt.sh --list` for the live table with the currently active recipe starred.
+
+---
+
 ## 8. Model architecture details (from `config.json` + `metadata.json`)
 
 - **Backbone**: NVEagle with Qwen3-1.7B LLM + SigLip2-400M vision encoder

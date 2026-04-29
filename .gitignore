@@ -178,3 +178,15 @@ test_outputs/
 # source-tracked file; it lands here only after `./run.sh --download-assets`.
 robocasa/models/assets/README.md
 
+
+# GR00T server companion: large bind-mounted assets (user downloads via ./groot_docker_n1.5/run.sh --download-ckpt)
+groot_docker_n1.5/checkpoint/gr00t_n1-5/
+groot_docker_n1.5/checkpoint/.cache/
+# Active-recipe symlinks at checkpoint/ root — recreated locally by --download-ckpt or by swap_ckpt.sh.
+groot_docker_n1.5/checkpoint/config.json
+groot_docker_n1.5/checkpoint/experiment_cfg
+groot_docker_n1.5/checkpoint/model-*.safetensors*
+groot_docker_n1.5/checkpoint/model.safetensors.index.json
+# Upstream Isaac-GR00T clone (user does: git clone -b n1.5-release https://github.com/NVIDIA/Isaac-GR00T groot_docker_n1.5/Isaac-GR00T)
+groot_docker_n1.5/Isaac-GR00T/
+

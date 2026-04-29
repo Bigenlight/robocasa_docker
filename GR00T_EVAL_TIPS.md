@@ -80,7 +80,7 @@ Each block: symptom / root cause / fix / how to verify.
   - `state.base_rotation` (idx 3:7) at t=0 is `[0., 0., 1., 0.]` -- 180 deg about Z (xyzw).
   - `state.end_effector_rotation_relative` (idx 10:14) at t=0 is `[-0.9865, 0.0096, -0.1627, 0.0160]`, norm = 1.0 -- approximately 180 deg about X (EE pointing down). Scalar component is the trailing 0.0160, not the leading -0.9865.
 - The state dimension layout is also confirmed by `meta/modality.json`: `base_position[0:3]`, `base_rotation[3:7]`, `end_effector_position_relative[7:10]`, `end_effector_rotation_relative[10:14]`, `gripper_qpos[14:16]`. Action layout: `base_motion[0:4]`, `control_mode[4:5]`, `end_effector_position[5:8]`, `end_effector_rotation[8:11]`, `gripper_close[11:12]`.
-- The metadata declares `rotation_type: 'quaternion'` for `end_effector_rotation_relative` (`/home/theo/workspace/groot_docker/checkpoint/experiment_cfg/metadata.json` -> `state.end_effector_rotation_relative`). The server's `StateActionTransform` converts quat -> rotation_6d for the model; verify in `serve_groot.py` that you're handing it the raw 4-element xyzw and not pre-converting.
+- The metadata declares `rotation_type: 'quaternion'` for `end_effector_rotation_relative` (`/home/theo/workspace/robocasa_docker/groot_docker_n1.5/checkpoint/experiment_cfg/metadata.json` -> `state.end_effector_rotation_relative`). The server's `StateActionTransform` converts quat -> rotation_6d for the model; verify in `serve_groot.py` that you're handing it the raw 4-element xyzw and not pre-converting.
 
 ---
 
@@ -114,7 +114,7 @@ Copy this and tick before each run.
 - [ ] `--num-rollouts 5` minimum (single rollout is noisy).
 - [ ] `--output-dir test_outputs/<descriptive_name>/` to avoid clobbering previous runs.
 - [ ] `--split pretrain` for multitask checkpoint (use `target` only when explicitly evaluating held-out kitchens).
-- [ ] After done, stop the server: `(cd /home/theo/workspace/groot_docker && ./run.sh --stop)`.
+- [ ] After done, stop the server: `(cd /home/theo/workspace/robocasa_docker/groot_docker_n1.5 && ./run.sh --stop)`.
 - [ ] Note `mean_lat` in summary.json -- ~95-110 ms per `/act` call on A6000 is healthy. Sustained higher means CPU contention or you forgot to warm the model.
 
 ---
@@ -133,7 +133,7 @@ Tier the investigation:
 
 | Component | Ours | Canonical |
 |---|---|---|
-| Inference transport | HTTP (FastAPI), port 8500 -- `/home/theo/workspace/groot_docker/serve_groot.py` | zmq via `RobotInferenceServer`, port 5555 -- `Isaac-GR00T/gr00t/eval/robot.py` |
+| Inference transport | HTTP (FastAPI), port 8500 -- `/home/theo/workspace/robocasa_docker/groot_docker_n1.5/serve_groot.py` | zmq via `RobotInferenceServer`, port 5555 -- `Isaac-GR00T/gr00t/eval/robot.py` |
 | Eval driver | custom client loop -- `examples/run_groot_eval.py` | `SimulationInferenceClient` + `MultiStepWrapper` -- `Isaac-GR00T/gr00t/eval/simulation.py` |
 | Per-task horizon | `lookup_task_horizon` -> `robocasa.utils.dataset_registry_utils.get_task_horizon` (`run_groot_eval.py:118-127`) | same, via `get_task_horizon` (`run_eval.py:23, 76`) |
 
@@ -169,14 +169,14 @@ Both implement the same dot-namespace contract (`observation.images.<cam>`, `obs
 |---|---|
 | `/home/theo/workspace/robocasa_docker/robocasa/wrappers/gym_wrapper.py` | `RoboCasaGymEnv` (line 130), `PandaOmronKeyConverter` (line 20), `unmap_action` binarization (line 108-127), gym registration (line 375-378). |
 | `/home/theo/workspace/robocasa_docker/examples/run_groot_eval.py` | Our eval client, current `gym.make` call (line 469-474), task aliases (line 102-115). |
-| `/home/theo/workspace/groot_docker/Isaac-GR00T/gr00t/eval/simulation.py` | `SimulationInferenceClient`, `MultiStepConfig` (line 60-66, default `n_action_steps=16`). |
-| `/home/theo/workspace/groot_docker/Isaac-GR00T/gr00t/eval/wrappers/multistep_wrapper.py` | `MultiStepWrapper.step` chunk consumer (line 200-241). |
-| `/home/theo/workspace/groot_docker/Isaac-GR00T/scripts/eval_policy.py` | Upstream NVIDIA offline-replay MSE eval (not env rollout). |
+| `/home/theo/workspace/robocasa_docker/groot_docker_n1.5/Isaac-GR00T/gr00t/eval/simulation.py` | `SimulationInferenceClient`, `MultiStepConfig` (line 60-66, default `n_action_steps=16`). |
+| `/home/theo/workspace/robocasa_docker/groot_docker_n1.5/Isaac-GR00T/gr00t/eval/wrappers/multistep_wrapper.py` | `MultiStepWrapper.step` chunk consumer (line 200-241). |
+| `/home/theo/workspace/robocasa_docker/groot_docker_n1.5/Isaac-GR00T/scripts/eval_policy.py` | Upstream NVIDIA offline-replay MSE eval (not env rollout). |
 | `/home/theo/workspace/robocasa_docker/docs/reference_canonical/run_eval.py` | Canonical robocasa-benchmark/Isaac-GR00T env-rollout eval (mirrored from upstream main). CLI default `n_action_steps=16` at line 159. |
 | `/home/theo/workspace/robocasa_docker/docs/reference_canonical/eval_policy.py` | Canonical offline replay-MSE eval (sanity check that the model loads & decodes correctly). |
 | `/home/theo/workspace/robocasa_docker/docs/reference_canonical/inference_service.py` | Canonical zmq-based reference server — instructive for the dot-namespace API the model expects. |
 | `/tmp/robocasa_train_data/pnp/lerobot/meta/info.json` | Training data: 256x256, fps=20, h264 yuv420p. |
 | `/tmp/robocasa_train_data/pnp/lerobot/meta/modality.json` | State and action sub-key layouts. |
 | `/tmp/robocasa_train_data/pnp/lerobot/data/chunk-000/episode_000000.parquet` | Raw training values; ground-truth for any "what does the model expect" question. |
-| `/home/theo/workspace/groot_docker/serve_groot.py` | Our HTTP server (FastAPI :8500). `DEFAULT_N_ACTION_STEPS = 16` at line 104. |
-| `/home/theo/workspace/groot_docker/checkpoint/experiment_cfg/metadata.json` | Checkpoint embodiment statistics + min_max bounds. |
+| `/home/theo/workspace/robocasa_docker/groot_docker_n1.5/serve_groot.py` | Our HTTP server (FastAPI :8500). `DEFAULT_N_ACTION_STEPS = 16` at line 104. |
+| `/home/theo/workspace/robocasa_docker/groot_docker_n1.5/checkpoint/experiment_cfg/metadata.json` | Checkpoint embodiment statistics + min_max bounds. |

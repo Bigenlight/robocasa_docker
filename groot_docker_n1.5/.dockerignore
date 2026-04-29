@@ -1,0 +1,4 @@
+# Image bakes deps only; everything else is bind-mounted at runtime.
+*
+!Dockerfile
+!.dockerignore

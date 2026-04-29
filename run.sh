@@ -39,6 +39,7 @@ ROLLOUT_SEED=0
 ROLLOUT_SEED_BASE=0
 ROLLOUT_MAX_STEPS=""
 ROLLOUT_REPLAY_CHUNK=""
+ROLLOUT_SPLIT="pretrain"
 GROOT_SERVER="${GROOT_SERVER:-http://localhost:8500}"
 EXTRA_DOCKER_ARGS=""
 
@@ -63,13 +64,17 @@ Usage:
           - n_action_steps=16 full chunk replay
           - per-task horizon from get_task_horizon(<Task>)
           - 5-state, 5-action-subkey, 3-camera contract (matches metadata.json)
-          - split=pretrain (multitask checkpoint kitchens)
           - emits N mp4s + groot_<Task>_summary.json
         Options:
           --num-rollouts N   number of trials (default 1)
           --seed-base N      first trial seed (default 0); seeds are base..base+N-1
           --max-steps N      override per-task horizon
           --replay-chunk N   override full-chunk replay (1 = closed-loop)
+          --split pretrain|target  scenes to evaluate on (default ${ROLLOUT_SPLIT}).
+                                   Use 'pretrain' for the multitask checkpoint
+                                   (Sec 4.1 / Table 1 of the paper).
+                                   Use 'target' for any target_only/target_pt/
+                                   pretraining checkpoint (Sec 4.2 / Table 2).
 
 Environment:
   ROBOCASA_IMAGE   override image tag (default: robocasa-eval:latest)
@@ -94,6 +99,7 @@ while [[ $# -gt 0 ]]; do
         --seed-base)          ROLLOUT_SEED_BASE="$2"; shift 2 ;;
         --max-steps)          ROLLOUT_MAX_STEPS="$2"; shift 2 ;;
         --replay-chunk)       ROLLOUT_REPLAY_CHUNK="$2"; shift 2 ;;
+        --split)              ROLLOUT_SPLIT="$2"; shift 2 ;;
         -h|--help)            usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
@@ -297,7 +303,7 @@ python /workspace/robocasa/examples/run_groot_eval.py \
             bash -c "$PREAMBLE
 python /workspace/robocasa/examples/run_groot_eval.py \
     --task '$ROLLOUT_TASK' \
-    --split pretrain \
+    --split '$ROLLOUT_SPLIT' \
     --num-rollouts $ROLLOUT_NUM \
     --seed-base $ROLLOUT_SEED_BASE \
     --server '$GROOT_SERVER' \

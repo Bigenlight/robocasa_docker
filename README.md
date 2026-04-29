@@ -18,7 +18,7 @@ This fork wraps upstream RoboCasa365 in a Docker workflow so a fresh machine can
 | Image | Repo | Role |
 |---|---|---|
 | `bigenlight/robocasa-eval` | this repo (`robocasa_docker/`) | Sim + headless render + eval client |
-| `bigenlight/groot-server` | `groot_docker/` (companion repo) | GR00T-N1.5 HTTP policy server (port 8500) |
+| `bigenlight/groot-server` | `groot_docker_n1.5/` (subdir of this repo) | GR00T-N1.5 HTTP policy server (port 8500) |
 
 Both images bake only Python dependencies; the simulator source, the robosuite source, the kitchen assets, and the GR00T checkpoint all live on the host and are bind-mounted at runtime. That means image rebuilds, container removals, and version bumps never destroy your work.
 
@@ -80,21 +80,52 @@ Override the image with `ROBOCASA_IMAGE=...` / the GR00T URL with `GROOT_SERVER=
 
 ## Two-container GR00T eval (closed loop)
 
-The GR00T-N1.5 policy lives in a sibling repo (`groot_docker/`) so it can be reused by other simulators. Both containers share `--network host`, so the eval client reaches the server at `http://localhost:8500`.
+The GR00T-N1.5 policy lives in `groot_docker_n1.5/` (a subdirectory of this repo, bundled in-tree). Both containers share `--network host`, so the eval client reaches the server at `http://localhost:8500`.
 
-**Step A — clone the companion repo:**
+<!-- Note: the companion server repo used to be a separate clone; it is now bundled at groot_docker_n1.5/, so no separate clone step is needed. -->
+
+### Choose a checkpoint
+
+Pick a recipe based on what you want to demonstrate. The recipe name is the argument to `groot_docker_n1.5/swap_ckpt.sh <recipe>`; the SR figures are RoboCasa365 paper averages (see [`GR00T_CHECKPOINTS.md`](GR00T_CHECKPOINTS.md) for the full catalog and per-task breakdown).
+
+| Goal | Recipe | Paper SR |
+|---|---|---|
+| Default / out-of-box pretraining baseline | `multitask` | composite-seen 9.6% |
+| Best closed-loop on composite-seen tasks | `target_pt_composite_seen` | composite-seen 40.6% |
+| Best on atomic tasks | `target_pt_atomic` | atomic 68.5% |
+| Generalize to composite-unseen tasks | `target_pt_composite_unseen` | composite-unseen 42.1% |
+| Foundation-only (no post-training) | `pretraining` | composite-seen 0% / atomic 41.9% |
+
+**Step A — bring up the GR00T server:**
 
 ```sh
-git clone <groot_docker fork> ../groot_docker
-cd ../groot_docker
-```
-
-**Step B — bring up the GR00T server:**
-
-```sh
+# First time: build (or pull) the image
+cd groot_docker_n1.5
 ./run.sh --build                                                    # ~12 GB image
+# alternative:  docker pull bigenlight/groot-server:n1.5
+
+# Clone Isaac-GR00T inside the subdir at the n1.5-release tag
 git clone https://github.com/NVIDIA/Isaac-GR00T -b n1.5-release ./Isaac-GR00T
+
+# Download the chosen checkpoint. --download-ckpt fetches the default
+# multitask recipe; for any other recipe see groot_docker_n1.5/README.md §6.
 ./run.sh --download-ckpt                                            # ~7.6 GB without optimizer.pt
+
+# (Optional) Use a different recipe — e.g. target_pt_composite_seen (40% on
+# PrepareCoffee). Two steps: (1) download the recipe (it's NOT downloaded by
+# --download-ckpt, which is multitask-only), then (2) repoint symlinks. See
+# groot_docker_n1.5/README.md §5-§6 for the recipe table and full workflow.
+RECIPE_PATH="gr00t_n1-5/foundation_model_learning/target_posttraining/composite_seen/checkpoint-60000"
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp/groot-home \
+    -v "$PWD/checkpoint:/groot/checkpoint" \
+    -v "$HOME/.cache/huggingface:/tmp/groot-home/.cache/huggingface" \
+    groot-server:latest \
+    bash -c "mkdir -p /tmp/groot-home && \
+      huggingface-cli download robocasa/robocasa365_checkpoints \
+        --include '${RECIPE_PATH}/*' --exclude '*optimizer*' --local-dir /groot/checkpoint"
+./swap_ckpt.sh target_pt_composite_seen                             # repoint symlinks; pass --list to see all 12 recipes
+
+# Start the server in the background
 ./run.sh --serve-bg                                                 # detached, named groot-server
 docker logs -f groot-server                                         # wait for "policy ready" (Uvicorn binds before model load)
 # alternatively poll: until [ "$(curl -fsS http://127.0.0.1:8500/health 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')" = ok ]; do sleep 5; done
@@ -102,12 +133,19 @@ docker logs -f groot-server                                         # wait for "
 
 `./run.sh --smoke` runs a dummy server end-to-end without the real model — useful for verifying the protocol on a machine without a GPU.
 
-**Step C — run the eval client (back in this repo):**
+**Step B — run the eval client (back in `robocasa_docker/`):**
 
 ```sh
-cd ../robocasa_docker
-./run.sh --canonical-eval PickPlaceCounterToSink --num-rollouts 5 --seed-base 0
-# (single-seed quick check: ./run.sh --groot-eval PickPlaceCounterToSink --steps 60 --seed 0)
+cd ..   # back to robocasa_docker (the repo root)
+
+# Multitask checkpoint → split=pretrain (Sec 4.1 / Table 1 of paper)
+./run.sh --canonical-eval PickPlaceCounterToSink --num-rollouts 5 --seed-base 0 --split pretrain
+
+# Any target_only / target_posttraining / pretraining checkpoint → split=target (Sec 4.2 / Table 2)
+./run.sh --canonical-eval PrepareCoffee --num-rollouts 5 --seed-base 0 --split target
+
+# Single-seed quick check:
+./run.sh --groot-eval PickPlaceCounterToSink --steps 60 --seed 0
 ```
 
 What success looks like (real `groot_PickPlaceCounterToSink_summary.json` from a 5-rollout run):
@@ -128,17 +166,38 @@ DONE  task=PickPlaceCounterToSink  success=3/5  rate=0.60  mean_lat=104.1ms
 
 Per-trial mean latencies in `groot_PickPlaceCounterToSink_summary.json` were 119.1, 98.9, 104.4, 97.7, 100.2 ms (avg 104.1ms). The first trial pays a model warmup cost; subsequent trials sit ~95–105 ms.
 
-Latency around 100 ms / chunk on RTX A6000. Action chunks are 16 steps; the client replays the full 16 before re-querying — this matches the canonical RoboCasa convention (`MultiStepConfig.n_action_steps=16` in `robocasa-benchmark/Isaac-GR00T/scripts/run_eval.py`). The 8-step replay used by NVIDIA's GR1-tabletop-tasks reference repo is **not** the RoboCasa default. Override with `--replay-chunk` if you need to compare. Per-task expected SR for the multitask checkpoint is in [`GR00T_CHECKPOINTS.md`](GR00T_CHECKPOINTS.md) §10. When the run is done, stop the server with `(cd ../groot_docker && ./run.sh --stop)`.
+Latency around 100 ms / chunk on RTX A6000. Action chunks are 16 steps; the client replays the full 16 before re-querying — this matches the canonical RoboCasa convention (`MultiStepConfig.n_action_steps=16` in `robocasa-benchmark/Isaac-GR00T/scripts/run_eval.py`). The 8-step replay used by NVIDIA's GR1-tabletop-tasks reference repo is **not** the RoboCasa default. Override with `--replay-chunk` if you need to compare. Per-task expected SR for the multitask checkpoint is in [`GR00T_CHECKPOINTS.md`](GR00T_CHECKPOINTS.md) §10. When the run is done, stop the server with `(cd groot_docker_n1.5 && ./run.sh --stop)`.
 
 For checkpoint variants (atomic / composite-seen / composite-unseen / lifelong) and per-task success rates, see [`GR00T_CHECKPOINTS.md`](GR00T_CHECKPOINTS.md).
 
-### Verified results (multitask checkpoint, GR00T-N1.5)
+### Verified results (GR00T-N1.5)
 
-| Task | SR | Notes |
-|---|---|---|
-| PnPCounterToSink (atomic) | 3/5 = 60% | seeds 0,2,4 ✓; seeds 1,3 ✗; mean_lat 104ms |
+| Task | Checkpoint | SR | Notes |
+|---|---|---|---|
+| PnPCounterToSink (atomic) | `multitask` | 3/5 = 60% | seeds 0,2,4 ✓; seeds 1,3 ✗; mean_lat 104ms |
+| PrepareCoffee (composite-seen) | `target_pt_composite_seen` | 2/5 = 40% | seeds 1 (step 585) and 4 (step 1174) ✓; per-trial latencies 105/103/107/102/103 ms (avg ~104). Paper reports PrepareCoffee specific = 13%, composite-seen average = 40.6%. summary.json at `test_outputs/eval_composite_pc/`. |
+| PrepareCoffee (composite-seen) | `multitask` | 0/5 = 0% | All seeds time out at 1200 steps. Consistent with the paper's 0% PrepareCoffee SR for the pretraining-only multitask checkpoint. summary.json at `test_outputs/eval_canonical_pc/`. |
 
 Reference: the RoboCasa365 paper reports a 43% atomic average for the multitask pretraining-only checkpoint, so 60% on PnPCounterToSink is within (above) the expected range. Common pitfalls (image size, kwargs, replay chunk) and how we got here are in [`GR00T_EVAL_TIPS.md`](GR00T_EVAL_TIPS.md).
+
+### Where checkpoints live
+
+`groot_docker_n1.5/checkpoint/` is a flat directory of 5 symlinks at its root (`config.json`, `experiment_cfg`, `model-00001-of-00002.safetensors`, `model-00002-of-00002.safetensors`, `model.safetensors.index.json`) that point into one of the `gr00t_n1-5/.../checkpoint-N/` recipe subdirs. Multiple recipes can coexist on disk; `swap_ckpt.sh` just repoints those 5 symlinks. The server bind-mounts `checkpoint/` read-only and resolves the symlinks at start, so a swap takes effect on the next `./run.sh --serve-bg`.
+
+```
+groot_docker_n1.5/checkpoint/
+├── config.json                       -> gr00t_n1-5/foundation_model_learning/target_posttraining/composite_seen/checkpoint-60000/config.json
+├── experiment_cfg                    -> .../composite_seen/checkpoint-60000/experiment_cfg
+├── model-00001-of-00002.safetensors  -> .../composite_seen/checkpoint-60000/model-00001-of-00002.safetensors
+├── model-00002-of-00002.safetensors  -> .../composite_seen/checkpoint-60000/model-00002-of-00002.safetensors
+├── model.safetensors.index.json      -> .../composite_seen/checkpoint-60000/model.safetensors.index.json
+└── gr00t_n1-5/
+    ├── multitask_learning/checkpoint-120000/             # downloaded by --download-ckpt
+    └── foundation_model_learning/target_posttraining/    # populated per swap_ckpt.sh hint
+        └── composite_seen/checkpoint-60000/
+```
+
+See `groot_docker_n1.5/README.md` §4 (file layout) and §5 (swap workflow) for the full recipe table and download commands.
 
 ---
 
@@ -157,10 +216,13 @@ HOST robocasa_docker/                              CONTAINER (bigenlight/robocas
                                                    --user $(id -u):$(id -g)
                                                    HOME=/tmp/robocasa-home
 
-HOST groot_docker/                                 CONTAINER (bigenlight/groot-server, --network host)
+HOST robocasa_docker/groot_docker_n1.5/            CONTAINER (bigenlight/groot-server, --network host)
+├── Dockerfile  run.sh  swap_ckpt.sh                (host scripts; not mounted)
 ├── serve_groot.py             (read-only mount)   /groot/serve_groot.py
 ├── Isaac-GR00T/               (host-cloned)       /groot/Isaac-GR00T
 └── checkpoint/                (--download-ckpt)   /groot/checkpoint               (ro)
+    ├── (5 root symlinks)         resolved at start by the server
+    └── gr00t_n1-5/.../checkpoint-N/   one or more recipe dirs
                                                    exposes  http://0.0.0.0:8500
 ```
 
@@ -174,8 +236,8 @@ The container always runs as your host UID/GID, so files written into the bind m
 |---|---|---|
 | `robocasa/models/assets/` (~23 GB) | size; survives image rebuilds | `./run.sh --download-assets` |
 | `robosuite/` | upstream pinned to master; lets you patch in-place | `git clone https://github.com/ARISE-Initiative/robosuite ./robosuite` |
-| GR00T checkpoint (~7.6 GB) | size; checkpoint variants swap often | `cd ../groot_docker && ./run.sh --download-ckpt` |
-| `Isaac-GR00T/` source | upstream API moves; lets you pin a commit | `git clone https://github.com/NVIDIA/Isaac-GR00T -b n1.5-release ../groot_docker/Isaac-GR00T` |
+| GR00T checkpoint (~7.6 GB) | size; checkpoint variants swap often | `cd groot_docker_n1.5 && ./run.sh --download-ckpt` |
+| `Isaac-GR00T/` source | upstream API moves; lets you pin a commit | `git clone https://github.com/NVIDIA/Isaac-GR00T -b n1.5-release groot_docker_n1.5/Isaac-GR00T` |
 
 ---
 
@@ -189,8 +251,8 @@ The container always runs as your host UID/GID, so files written into the bind m
 | Files in `test_outputs/` owned by root | Custom `docker run` missing `--user` | Use `./run.sh`, or mirror its `--user $(id -u):$(id -g) -e HOME=/tmp/robocasa-home` |
 | `AttributeError: 'OrderEnforcing' object has no attribute 'sim'` | gym 1.x removed `Wrapper.__getattr__` | Image pins `gymnasium==0.29.1`; don't override |
 | `download_kitchen_assets.py` hangs at `Proceed? (y/n)` | stdin not piped through | Use `./run.sh --download-assets` (it pipes `yes y \|`); don't invoke the script directly |
-| `--groot-eval`: `server at http://localhost:8500 not ready` | GR00T container not running | `cd ../groot_docker && ./run.sh --serve-bg && docker logs -f groot-server` |
-| `bind: address already in use` on port 8500 | another GR00T server alive | `(cd ../groot_docker && ./run.sh --stop)` or set `GROOT_PORT=8501 GROOT_SERVER=http://localhost:8501 ./run.sh --groot-eval ...` |
+| `--groot-eval`: `server at http://localhost:8500 not ready` | GR00T container not running | `cd groot_docker_n1.5 && ./run.sh --serve-bg && docker logs -f groot-server` |
+| `bind: address already in use` on port 8500 | another GR00T server alive | `(cd groot_docker_n1.5 && ./run.sh --stop)` or set `GROOT_PORT=8501 GROOT_SERVER=http://localhost:8501 ./run.sh --groot-eval ...` |
 | Pip can't satisfy `numpy==2.2.5` in a downstream image | transitive dep (lerobot / tianshou) pinning `numpy<2` | Install those `--no-deps` (this image already does) |
 
 ---
@@ -228,9 +290,9 @@ When debugging an eval, open these files in this order — they are the ground t
 | [`docs/reference_canonical/run_eval.py`](docs/reference_canonical/run_eval.py) | The `robocasa-benchmark/Isaac-GR00T/scripts/run_eval.py` (downloaded from upstream main). Single-file driver: starts a zmq `RobotInferenceServer`, then loops `SimulationInferenceClient.run_simulation(SimulationConfig(...))` over each task in the task set. **Default `n_action_steps=16`, `n_episodes=50`, `n_envs=5`.** |
 | [`docs/reference_canonical/eval_policy.py`](docs/reference_canonical/eval_policy.py) | Offline replay-MSE eval (compares model actions to dataset ground truth). Useful sanity check for "is the model loading correctly", separate from env rollout. |
 | [`docs/reference_canonical/inference_service.py`](docs/reference_canonical/inference_service.py) | Reference HTTP/zmq server for the canonical contract — instructive for understanding the dot-namespace API the model expects. |
-| `../groot_docker/Isaac-GR00T/gr00t/eval/simulation.py` | `SimulationInferenceClient`, `SimulationConfig`, `MultiStepConfig` (default `n_action_steps=16` at line 65). The `run_simulation` loop is the canonical env-rollout body. |
-| `../groot_docker/Isaac-GR00T/gr00t/eval/wrappers/multistep_wrapper.py` | `MultiStepWrapper.step(action_dict)` consumes the chunk: `for step in range(self.n_action_steps): super().step(act_per_step)`. Read this before changing replay logic. |
-| `../groot_docker/Isaac-GR00T/scripts/eval_policy.py` | NVIDIA n1.5-release upstream version of `eval_policy.py` (checked-out in the GR00T container source tree). |
+| `groot_docker_n1.5/Isaac-GR00T/gr00t/eval/simulation.py` | `SimulationInferenceClient`, `SimulationConfig`, `MultiStepConfig` (default `n_action_steps=16` at line 65). The `run_simulation` loop is the canonical env-rollout body. |
+| `groot_docker_n1.5/Isaac-GR00T/gr00t/eval/wrappers/multistep_wrapper.py` | `MultiStepWrapper.step(action_dict)` consumes the chunk: `for step in range(self.n_action_steps): super().step(act_per_step)`. Read this before changing replay logic. |
+| `groot_docker_n1.5/Isaac-GR00T/scripts/eval_policy.py` | NVIDIA n1.5-release upstream version of `eval_policy.py` (checked-out in the GR00T container source tree). |
 
 ### Local pipeline (this repo — read these to understand "what we actually run")
 
@@ -238,7 +300,7 @@ When debugging an eval, open these files in this order — they are the ground t
 |---|---|
 | [`examples/run_groot_eval.py`](examples/run_groot_eval.py) | Our HTTP-based eval client (the script `run.sh --canonical-eval` invokes). Argparse at line 558. Action chunk consumption + base_motion zeroing in `run_one_trial`. |
 | [`robocasa/wrappers/gym_wrapper.py`](robocasa/wrappers/gym_wrapper.py) | The `RoboCasaGymEnv` wrapper. Default cameras 256×256 (line 33), `step()` expects a dict with `action.gripper_close, action.end_effector_position, ...` (line 313), `unmap_action` binarizes gripper at threshold 0.5 (line 108). Every `gym.make("robocasa/<Task>")` returns this. |
-| `../groot_docker/serve_groot.py` | Our FastAPI server on port 8500 (HTTP, not zmq — same dot-namespace contract). `_build_robocasa_modality()` mirrors `PandaOmronDataConfig.transform()`. |
+| `groot_docker_n1.5/serve_groot.py` | Our FastAPI server on port 8500 (HTTP, not zmq — same dot-namespace contract). `_build_robocasa_modality()` mirrors `PandaOmronDataConfig.transform()`. |
 | [`run.sh`](run.sh) | `--groot-eval` (single seed) → forwards `--num-steps`, `--seed`. `--canonical-eval` (multi-rollout) → forwards `--num-rollouts`, `--seed-base`, `--max-steps`, `--replay-chunk`. |
 
 ### Training data (verify what the model actually saw)
@@ -257,7 +319,7 @@ When debugging an eval, open these files in this order — they are the ground t
 - [`GR00T_CHECKPOINTS.md`](GR00T_CHECKPOINTS.md) — checkpoint catalog, paper-section mapping, per-task success rates
 - [`GR00T_EVAL_TIPS.md`](GR00T_EVAL_TIPS.md) — common GR00T-eval pitfalls + key insights from achieving the 60% PnP result
 - [`../VLA_COMMUNICATION_PROTOCOL.md`](../VLA_COMMUNICATION_PROTOCOL.md) — `/health` `/reset` `/act` HTTP contract
-- [`../groot_docker/README.md`](../groot_docker/README.md) — companion image (server side)
+- [`groot_docker_n1.5/README.md`](groot_docker_n1.5/README.md) — companion image (server side)
 - [`test_smoke.py`](test_smoke.py) — 6-step smoke test
 
 ---
