@@ -2,7 +2,7 @@
 
 This directory bakes a GPU-only Docker image that serves a GR00T-N1.5
 policy over HTTP on port 8500, conforming to
-[`/home/theo/workspace/VLA_COMMUNICATION_PROTOCOL.md`](../../VLA_COMMUNICATION_PROTOCOL.md).
+[`VLA_COMMUNICATION_PROTOCOL.md`](../VLA_COMMUNICATION_PROTOCOL.md).
 It lives **inside** the `robocasa_docker/` repo as the server-side
 companion to the eval client at
 [`../examples/run_groot_eval.py`](../examples/run_groot_eval.py); see
@@ -243,7 +243,7 @@ Other docker flags worth knowing: `--gpus all` (auto-detected from
 ## HTTP contract summary
 
 Three endpoints; full schema in
-[`../../VLA_COMMUNICATION_PROTOCOL.md`](../../VLA_COMMUNICATION_PROTOCOL.md).
+[`VLA_COMMUNICATION_PROTOCOL.md`](../VLA_COMMUNICATION_PROTOCOL.md).
 
 | Method | Path | Body | Returns |
 |---|---|---|---|

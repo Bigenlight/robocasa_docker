@@ -1,5 +1,5 @@
 """
-GR00T-N1.5 HTTP server conforming to /home/theo/workspace/VLA_COMMUNICATION_PROTOCOL.md.
+GR00T-N1.5 HTTP server conforming to ../VLA_COMMUNICATION_PROTOCOL.md.
 
 Endpoints:
     GET  /health          -> {status, model, action_type, action_keys, n_action_steps, ...}

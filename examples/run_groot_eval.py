@@ -19,7 +19,7 @@ Outputs per call (one task, N rollouts):
     test_outputs/groot_<Task>_summary.json               (rollup)
 
 The GR00T server lives in a separate container (see ../groot_docker_n1.5/) and
-follows /home/theo/workspace/VLA_COMMUNICATION_PROTOCOL.md. Both containers
+follows ../VLA_COMMUNICATION_PROTOCOL.md. Both containers
 share the host network, so the client reaches the server at
 http://localhost:8500.
 
@@ -46,7 +46,7 @@ import robocasa  # noqa: F401  -- registers gym envs as a side effect
 from PIL import Image, ImageDraw, ImageFont
 
 # Sub-key contract: must match groot_docker_n1.5/serve_groot.py and the protocol.
-# Verified against /home/theo/workspace/robocasa_docker/groot_docker_n1.5/checkpoint/experiment_cfg/metadata.json
+# Verified against groot_docker_n1.5/checkpoint/experiment_cfg/metadata.json
 # (5 state, 5 action sub-keys, all matching exactly).
 GROOT_ACTION_KEYS = [
     "action.base_motion",

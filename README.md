@@ -22,7 +22,7 @@ This fork wraps upstream RoboCasa365 in a Docker workflow so a fresh machine can
 
 Both images bake only Python dependencies; the simulator source, the robosuite source, the kitchen assets, and the GR00T checkpoint all live on the host and are bind-mounted at runtime. That means image rebuilds, container removals, and version bumps never destroy your work.
 
-For the design rationale see [`DOCKER.md`](DOCKER.md). For the GR00T checkpoint catalog see [`GR00T_CHECKPOINTS.md`](GR00T_CHECKPOINTS.md). For the HTTP contract between the two images see [`../VLA_COMMUNICATION_PROTOCOL.md`](../VLA_COMMUNICATION_PROTOCOL.md).
+For the design rationale see [`DOCKER.md`](DOCKER.md). For the GR00T checkpoint catalog see [`GR00T_CHECKPOINTS.md`](GR00T_CHECKPOINTS.md). For the HTTP contract between the two images see [`VLA_COMMUNICATION_PROTOCOL.md`](VLA_COMMUNICATION_PROTOCOL.md).
 
 ---
 
@@ -111,29 +111,33 @@ git clone https://github.com/NVIDIA/Isaac-GR00T -b n1.5-release ./Isaac-GR00T
 # multitask recipe; for any other recipe see groot_docker_n1.5/README.md §6.
 ./run.sh --download-ckpt                                            # ~7.6 GB without optimizer.pt
 
-# (Optional) Use a different recipe — e.g. target_pt_composite_seen (40% on
-# PrepareCoffee). Two steps: (1) download the recipe (it's NOT downloaded by
-# --download-ckpt, which is multitask-only), then (2) repoint symlinks. See
-# groot_docker_n1.5/README.md §5-§6 for the recipe table and full workflow.
-RECIPE_PATH="gr00t_n1-5/foundation_model_learning/target_posttraining/composite_seen/checkpoint-60000"
-docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp/groot-home \
-    -v "$PWD/checkpoint:/groot/checkpoint" \
-    -v "$HOME/.cache/huggingface:/tmp/groot-home/.cache/huggingface" \
-    groot-server:latest \
-    bash -c "mkdir -p /tmp/groot-home && \
-      huggingface-cli download robocasa/robocasa365_checkpoints \
-        --include '${RECIPE_PATH}/*' --exclude '*optimizer*' --local-dir /groot/checkpoint"
-./swap_ckpt.sh target_pt_composite_seen                             # repoint symlinks; pass --list to see all 12 recipes
-
 # Start the server in the background
 ./run.sh --serve-bg                                                 # detached, named groot-server
 docker logs -f groot-server                                         # wait for "policy ready" (Uvicorn binds before model load)
 # alternatively poll: until [ "$(curl -fsS http://127.0.0.1:8500/health 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')" = ok ]; do sleep 5; done
 ```
 
+> **Optional — swap to a different recipe.** Skip this if you just want PnPCounterToSink + multitask. To use a different recipe — e.g. `target_pt_composite_seen` (40% on PrepareCoffee) — first stop the server, then download the recipe (it's NOT downloaded by `--download-ckpt`, which is multitask-only), then repoint symlinks. See `groot_docker_n1.5/README.md` §5-§6 for the recipe table and full workflow.
+>
+> ```sh
+> ./run.sh --stop
+> RECIPE_PATH="gr00t_n1-5/foundation_model_learning/target_posttraining/composite_seen/checkpoint-60000"
+> docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp/groot-home \
+>     -v "$PWD/checkpoint:/groot/checkpoint" \
+>     -v "$HOME/.cache/huggingface:/tmp/groot-home/.cache/huggingface" \
+>     groot-server:latest \
+>     bash -c "mkdir -p /tmp/groot-home && \
+>       huggingface-cli download robocasa/robocasa365_checkpoints \
+>         --include '${RECIPE_PATH}/*' --exclude '*optimizer*' --local-dir /groot/checkpoint"
+> ./swap_ckpt.sh target_pt_composite_seen                             # repoint symlinks; pass --list to see all 12 recipes
+> ./run.sh --serve-bg
+> ```
+
 `./run.sh --smoke` runs a dummy server end-to-end without the real model — useful for verifying the protocol on a machine without a GPU.
 
 **Step B — run the eval client (back in `robocasa_docker/`):**
+
+`--split` selects which kitchen scenes to evaluate on. Use `pretrain` for the multi-task checkpoint (Sec 4.1, the kitchens it trained on) and `target` for any `target_only/` or `target_posttraining/` recipe (Sec 4.2, held-out kitchens those models were fine-tuned on). The recipe-to-split mapping is in [`GR00T_CHECKPOINTS.md`](GR00T_CHECKPOINTS.md) §4.
 
 ```sh
 cd ..   # back to robocasa_docker (the repo root)
@@ -305,11 +309,13 @@ When debugging an eval, open these files in this order — they are the ground t
 
 ### Training data (verify what the model actually saw)
 
-| Path | Purpose |
+The LeRobot training data is hosted on HuggingFace at [`huggingface.co/datasets/robocasa/robocasa365_lerobot`](https://huggingface.co/datasets/robocasa/robocasa365_lerobot) (~10 GB). Download separately if you want to inspect the canonical state/action values the model was trained on.
+
+| Path (on HF) | Purpose |
 |---|---|
-| `/tmp/robocasa_train_data/pnp/lerobot/meta/info.json` | Declares cameras 256×256, fps=20, h264 yuv420p. Authoritative for inference resolution. |
-| `/tmp/robocasa_train_data/pnp/lerobot/meta/modality.json` | State (16d) + action (12d) sub-key layouts. |
-| `/tmp/robocasa_train_data/pnp/lerobot/data/chunk-000/episode_000000.parquet` | Raw state/action values. Inspect with: `docker run --rm -v /tmp/robocasa_train_data:/tmp/robocasa_train_data:ro groot-server:latest python3 /tmp/robocasa_train_data/dump_state.py` |
+| `pnp/lerobot/meta/info.json` | Declares cameras 256×256, fps=20, h264 yuv420p. Authoritative for inference resolution. |
+| `pnp/lerobot/meta/modality.json` | State (16d) + action (12d) sub-key layouts. |
+| `pnp/lerobot/data/chunk-000/episode_000000.parquet` | Raw state/action values. |
 
 ---
 
@@ -318,7 +324,7 @@ When debugging an eval, open these files in this order — they are the ground t
 - [`DOCKER.md`](DOCKER.md) — design notes, file layout, design decisions
 - [`GR00T_CHECKPOINTS.md`](GR00T_CHECKPOINTS.md) — checkpoint catalog, paper-section mapping, per-task success rates
 - [`GR00T_EVAL_TIPS.md`](GR00T_EVAL_TIPS.md) — common GR00T-eval pitfalls + key insights from achieving the 60% PnP result
-- [`../VLA_COMMUNICATION_PROTOCOL.md`](../VLA_COMMUNICATION_PROTOCOL.md) — `/health` `/reset` `/act` HTTP contract
+- [`VLA_COMMUNICATION_PROTOCOL.md`](VLA_COMMUNICATION_PROTOCOL.md) — `/health` `/reset` `/act` HTTP contract
 - [`groot_docker_n1.5/README.md`](groot_docker_n1.5/README.md) — companion image (server side)
 - [`test_smoke.py`](test_smoke.py) — 6-step smoke test
 
