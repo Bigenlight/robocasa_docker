@@ -13,16 +13,17 @@
 
 ## What this fork adds
 
-This fork wraps upstream RoboCasa365 in a Docker workflow so a fresh machine can run a headless rollout (sim + render → mp4) and a closed-loop GR00T-N1.5 evaluation **without installing anything Python on the host**. Two images cooperate:
+This fork wraps upstream RoboCasa365 in a Docker workflow so a fresh machine can run a headless rollout (sim + render → mp4), a closed-loop GR00T-N1.5 evaluation, and a Diffusion Policy evaluation **without installing anything Python on the host**. Three images cooperate; the GR00T flow uses two containers + HTTP, the Diffusion Policy flow runs the policy in-process inside a single container:
 
 | Image | Repo | Role |
 |---|---|---|
 | `bigenlight/robocasa-eval` | this repo (`robocasa_docker/`) | Sim + headless render + eval client |
 | `bigenlight/groot-server` | `groot_docker_n1.5/` (subdir of this repo) | GR00T-N1.5 HTTP policy server (port 8500) |
+| `bigenlight/dp-eval` | `dp_docker/` (subdir of this repo) | Sim + Diffusion Policy in-process eval (single container, no HTTP server) |
 
-Both images bake only Python dependencies; the simulator source, the robosuite source, the kitchen assets, and the GR00T checkpoint all live on the host and are bind-mounted at runtime. That means image rebuilds, container removals, and version bumps never destroy your work.
+All three images bake only Python dependencies; the simulator source, the robosuite source, the kitchen assets, and the policy checkpoints all live on the host and are bind-mounted at runtime. That means image rebuilds, container removals, and version bumps never destroy your work.
 
-For the design rationale see [`DOCKER.md`](DOCKER.md). For the GR00T checkpoint catalog see [`GR00T_CHECKPOINTS.md`](GR00T_CHECKPOINTS.md). For the HTTP contract between the two images see [`VLA_COMMUNICATION_PROTOCOL.md`](VLA_COMMUNICATION_PROTOCOL.md).
+For the design rationale see [`DOCKER.md`](DOCKER.md). For the GR00T checkpoint catalog see [`GR00T_CHECKPOINTS.md`](GR00T_CHECKPOINTS.md). For the HTTP contract between the GR00T images see [`VLA_COMMUNICATION_PROTOCOL.md`](VLA_COMMUNICATION_PROTOCOL.md). For the DP eval setup see [`dp_docker/README.md`](dp_docker/README.md).
 
 ---
 
@@ -35,6 +36,7 @@ For the design rationale see [`DOCKER.md`](DOCKER.md). For the GR00T checkpoint 
 | GPU | CUDA-capable, Ampere or newer; team runs RTX A6000 |
 | Disk (sim) | ~9 GB image + ~23 GB kitchen assets |
 | Disk (GR00T) | ~12 GB image + ~7.6 GB checkpoint (without optimizer state) |
+| Disk (DP) | ~22 GB image + ~1.7 GB checkpoint |
 | Network | HuggingFace access for asset + checkpoint download |
 | Host Python | **None.** Do not `pip install` anything on the host. |
 
@@ -205,6 +207,26 @@ See `groot_docker_n1.5/README.md` §4 (file layout) and §5 (swap workflow) for 
 
 ---
 
+## Diffusion Policy eval (single-container, in-process)
+
+In contrast to the two-container GR00T flow, the Diffusion Policy variant runs the policy **in-process** inside a single container — there is no port, no HTTP, no companion server. The container `bigenlight/dp-eval` extends `bigenlight/robocasa-eval` with the chi2023 Diffusion Policy stack (Hydra + PyTorch Lightning + the `robocasa-benchmark/diffusion_policy` fork) and invokes the released `latest.ckpt` directly. RoboCasa365 paper Table 1 reports DP at **15.7%** atomic-seen average (vs GR00T-N1.5 multitask at 43.0%) — DP is a weaker baseline by design and is included for benchmarking comparison.
+
+Quick start (from the repo root, ~30 min total on a fresh box):
+
+```sh
+cd dp_docker
+./run.sh --build                                                 # ~5-10 min (or pull bigenlight/dp-eval:latest)
+git clone https://github.com/robocasa-benchmark/diffusion_policy.git ./diffusion_policy
+./run.sh --download-ckpt                                         # ~1.7 GB, ~1-3 min
+./run.sh --eval PickPlaceCounterToSink --num-rollouts 5 --split pretrain
+```
+
+Verified result on RTX 3080 10 GB: **0/5 success on PnPCounterToSink**, ~705 ms per `predict_action` (100 DDPM steps × DT-Hybrid + ResNet × 3 cameras), 5-rollout wall-clock ~7 min — consistent with the paper's atomic-seen 15.7% magnitude.
+
+For full docs (architecture, checkpoint layout, troubleshooting), see [`dp_docker/README.md`](dp_docker/README.md).
+
+---
+
 ## Host ↔ container layout
 
 ```
@@ -325,7 +347,8 @@ The LeRobot training data is hosted on HuggingFace at [`huggingface.co/datasets/
 - [`GR00T_CHECKPOINTS.md`](GR00T_CHECKPOINTS.md) — checkpoint catalog, paper-section mapping, per-task success rates
 - [`GR00T_EVAL_TIPS.md`](GR00T_EVAL_TIPS.md) — common GR00T-eval pitfalls + key insights from achieving the 60% PnP result
 - [`VLA_COMMUNICATION_PROTOCOL.md`](VLA_COMMUNICATION_PROTOCOL.md) — `/health` `/reset` `/act` HTTP contract
-- [`groot_docker_n1.5/README.md`](groot_docker_n1.5/README.md) — companion image (server side)
+- [`groot_docker_n1.5/README.md`](groot_docker_n1.5/README.md) — companion image (GR00T server side)
+- [`dp_docker/README.md`](dp_docker/README.md) — Diffusion Policy in-process eval container
 - [`test_smoke.py`](test_smoke.py) — 6-step smoke test
 
 ---

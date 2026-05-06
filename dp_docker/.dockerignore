@@ -1,0 +1,14 @@
+# Anything bind-mounted at runtime should NOT be in the build context.
+diffusion_policy/
+checkpoint/
+test_outputs/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+
+# Git
+.git/
+.gitignore

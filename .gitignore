@@ -190,3 +190,8 @@ groot_docker_n1.5/checkpoint/model.safetensors.index.json
 # Upstream Isaac-GR00T clone (user does: git clone -b n1.5-release https://github.com/NVIDIA/Isaac-GR00T groot_docker_n1.5/Isaac-GR00T)
 groot_docker_n1.5/Isaac-GR00T/
 
+# DP eval companion: large bind-mounted assets (user clones fork + downloads via ./dp_docker/run.sh --download-ckpt)
+dp_docker/diffusion_policy/
+dp_docker/checkpoint/
+dp_docker/test_outputs/
+

@@ -123,3 +123,10 @@ git clone https://github.com/ARISE-Initiative/robosuite ./robosuite
 # poke around interactively
 ./run.sh --shell
 ```
+
+## Sibling images
+
+The sim eval container described above is the foundational image; two sibling containers extend it for closed-loop policy evaluation. Each lives in its own subdir with its own README and `run.sh`; they share the same bind-mount-not-bake philosophy described here:
+
+- [`groot_docker_n1.5/`](groot_docker_n1.5/README.md) — GR00T-N1.5 HTTP policy server (`bigenlight/groot-server`). Two-container topology: this sim image runs the env, that one serves the policy at port 8500. Communicates over the dot-namespace HTTP contract in [`VLA_COMMUNICATION_PROTOCOL.md`](VLA_COMMUNICATION_PROTOCOL.md).
+- [`dp_docker/`](dp_docker/README.md) — Diffusion Policy in-process eval (`bigenlight/dp-eval`). Single-container topology: extends `bigenlight/robocasa-eval` with the chi2023 DP stack and runs `eval_dp.py` in the same process as the env. No HTTP, no port, no protocol adapter.
