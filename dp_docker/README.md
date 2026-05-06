@@ -157,7 +157,7 @@ DP_CKPT_PATH="/dp/checkpoint/diffusion_policy/17.40.09_train_diffusion_transform
 |---|---|
 | `--build` | `docker build -t $DP_IMAGE .`. Layers DP-specific deps on top of `bigenlight/robocasa-eval:latest`. ~5-10 min on a fresh machine; ~30 s if base layers cached. |
 | `--download-ckpt` | One-shot container that runs `huggingface-cli download robocasa/robocasa365_checkpoints --include 'diffusion_policy/17.40.09_.../checkpoints/latest.ckpt' --local-dir /dp/checkpoint`. ~1.7 GB on disk. |
-| `--eval [<Task>] [--num-rollouts N --seed-base N --split <pretrain\|target> --num-envs N --max-steps N --device cuda:0]` | In-process closed-loop eval. `<Task>` is positional (default: `PickPlaceCounterToSink`). Any flag after it is forwarded to `eval_dp.py`. Defaults filled only for flags you don't pass: `--num-rollouts 5`, `--seed-base 0`, `--split pretrain`, `--num-envs 1`, `--max-steps` from `robocasa.utils.dataset_registry_utils.get_task_horizon × 1.5`, `--device $DP_DEVICE`. Writes per-trial mp4s + `dp_<Task>_summary.json` to `test_outputs/`. |
+| `--eval [<Task>] [--num-rollouts N --seed-base N --split <pretrain\|target> --num-envs N --max-steps N --device cuda:0 --[no-]allow-base-motion]` | In-process closed-loop eval. `<Task>` is positional (default: `PickPlaceCounterToSink`). Any flag after it is forwarded to `eval_dp.py`. Defaults filled only for flags you don't pass: `--num-rollouts 5`, `--seed-base 0`, `--split pretrain`, `--num-envs 1`, `--max-steps` from `robocasa.utils.dataset_registry_utils.get_task_horizon × 1.5`, `--device $DP_DEVICE`, `--allow-base-motion=True` (matches canonical `RobomimicImageWrapper.step`; pass `--no-allow-base-motion` for legacy zeroing). Writes per-trial mp4s + `dp_<Task>_summary.json` to `test_outputs/`. |
 | `--smoke` | Loads the **real** ckpt, instantiates the policy class, prints the resolved policy / workspace `_target_` + `n_action_steps` + `shape_meta.obs` keys + `shape_meta.action`, exits 0. Does NOT run a rollout. ~30 s. Verifies `torch.load + dill` works and the chi2023 workspace class chain is importable. (Unlike `groot_docker_n1.5/run.sh --smoke`, this is not a dummy-policy protocol probe — DP has no HTTP server, so smoke == real ckpt load.) |
 | `--list-tasks` | Prints the contents of `diffusion_policy/diffusion_policy/eval/eval_task_set.py` (the `TASK_SET_REGISTRY` keys: `atomic_seen`, `composite_seen`, `composite_unseen`, etc.) so you can choose a task name. |
 | `--shell` | Interactive bash with `PYTHONPATH=/dp/diffusion_policy:/workspace/robocasa:/workspace/robosuite`. For poking around the cfg, the workspace, etc. |
@@ -169,7 +169,7 @@ Override via env vars (all optional):
 |---|---|---|
 | `DP_IMAGE` | `dp-eval:latest` | Image tag used by every mode. |
 | `DP_CONTAINER_NAME` | `dp-eval` | Used by `--stop`. |
-| `DP_CKPT_PATH` | `/dp/checkpoint/diffusion_policy/17.40.09_train_diffusion_transformer_hybrid_pretrain_human300/checkpoints/latest.ckpt` | In-container path to the active ckpt. |
+| `DP_CKPT_PATH` | auto-resolved: prefers `latest.ckpt`, then `epoch=0500-test_mean_score=-1.000.ckpt` (leaderboard-aligned), then any `*.ckpt` in the checkpoints dir | In-container path to the active ckpt. Override to point at a different epoch. |
 | `DP_DEVICE` | `cuda:0` | Passed through to `policy.to(device)`. |
 | `MUJOCO_GL` | `egl` | Render backend. Set to `osmesa` to fall back if EGL fails. |
 
@@ -284,6 +284,49 @@ Compare to `multitask` GR00T-N1.5 on the same task on the same machine:
 roughly the paper's 43.0 / 15.7 = 2.7× spread, plus PnPCounterToSink
 appearing to be one of the easier atomic tasks for GR00T.
 
+### Eval correctness verification
+
+The 0/5 SR with consistent failure pattern across all 5 seeds initially
+looked like a wrapper bug. A 15-agent investigation + a parallel
+canonical-equivalence verifier identified **four** real misalignment
+bugs in the initial wrapper (now fixed):
+
+1. **Action layout** — `DP_ACTION_LAYOUT` used GR00T `modality.json`
+   concat order. Correct order per `cfg.shape_meta.action.lerobot_keys`
+   (and `lerobot_dataset.py:190-201`) is
+   `pos[0:3] / rot[3:6] / grip[6:7] / base[7:11] / mode[11:12]`.
+2. **Language encoder** — used `CLIPTextModel.pooler_output[0]`.
+   Training-time encoder is `robomimic.utils.lang_utils.LangEncoder`
+   which uses `CLIPTextModelWithProjection.text_embeds[0]` with
+   `padding="max_length"` (77 tokens) — different 768-d vector.
+3. **Task text source** — passed the Python class name
+   `"PickPlaceCounterToSink"` to the encoder. Training-time text is the
+   env obs key `obs["annotation.human.task_description"]`, a per-rollout
+   natural-language sentence (e.g. *"Pick the orange from the counter
+   and place it in the sink."*).
+4. **Base motion zeroing** — wrapper zeroed `action.base_motion` by
+   default; canonical `RobomimicImageWrapper.step` forwards it raw.
+   `--allow-base-motion` default flipped to `True`.
+
+After all 4 fixes, a Phase 7 numerical-parity smoke proved the wrapper
+is **bit-exact equivalent** to the canonical pipeline:
+
+| Probe | Result |
+|---|---|
+| Per-key obs `np.allclose` vs `RobomimicImageWrapper.process_obs` | all 7 obs keys, max_abs_diff = **0.0e+00** |
+| `policy.predict_action` action chunk parity | shape (1, 8, 12), max_abs_diff = **0.0e+00** |
+
+So 0/5 on PnPCounterToSink at n=5 is **not a wrapper bug** — it is
+exactly what binomial statistics predict for the paper's
+DP-multitask Atomic-Seen avg of 15.7%:
+**P(0/5 | p=0.157) ≈ 0.42** (i.e. ~42% of perfectly-calibrated trials
+would observe 0/5). For tighter signal, run **n ≥ 20**:
+P(0/20 | p=0.157) ≈ 0.034, so ≥1 success is ~96% likely if calibrated.
+
+The runtime assertion at `eval_dp.py:153` catches future
+`DP_ACTION_LAYOUT` regression by comparing it to the loaded ckpt's
+`cfg.shape_meta.action.lerobot_keys` at startup.
+
 ## What's NOT in this image
 
 | Not baked | Why | How it gets onto the host |
@@ -307,6 +350,7 @@ appearing to be one of the easier atomic tasks for GR00T.
 | `ModuleNotFoundError: No module named 'robomimic.X'` (any other class) | robomimic version skew | as above — the `robocasa` branch is canonical for this checkpoint |
 | First eval slow / hangs at "loading CLIP" / network warning | `transformers.CLIPTextModel.from_pretrained('openai/clip-vit-large-patch14')` runs once on the first eval (~600 MB) and persists via the host HF cache bind-mount (`~/.cache/huggingface`). | Wait once (~30 s on a fast link). Subsequent runs hit the cache. The wrapper also keeps a module-level cache so additional rollouts in the same process skip the GPU load entirely. |
 | `0/5 success on PnPCounterToSink` | Expected for the multitask DP checkpoint — paper reports **15.7% atomic-seen avg** (Table 1, §4.1) and there is no per-task PnP figure released. | This is on-distribution behavior. No target-FT'd DP recipe was released. Try `--num-rollouts 30` per task to get a meaningful per-task estimate, or run the full `atomic_seen` soup via the upstream `eval_robocasa.py` from `--shell`. |
+| `0/5 SR with consistent failure pattern across seeds` | Stronger version of the above. Originally we tracked this to four wrapper bugs (action layout / lang encoder / task text / base motion) all since fixed; see §"Eval correctness verification". The runtime assertion at `eval_dp.py:153` will fire on `DP_ACTION_LAYOUT` regression. | If the assertion fires, your wrapper has drifted from `cfg.shape_meta.action.lerobot_keys` — restore the layout. If it doesn't fire, your 0/5 is paper-consistent statistical noise (P(0/5\|p=0.157) ≈ 0.42); run n ≥ 20 for tighter signal. |
 | CUDA OOM on RTX 3060 (12 GB) | `--num-envs > 1` is tight at 12 GB once CLIP + DP-Hybrid + ResNet × 3 cams + MuJoCo render are co-resident | use `--num-envs 1` (default); lower `cfg.policy.num_inference_steps` if needed (will hurt SR); or force CLIP to CPU by exporting `CUDA_VISIBLE_DEVICES=-1` only during the lang-emb call (custom patch) |
 | EGL render fails | EGL probe fails inside container | run with `MUJOCO_GL=osmesa ./run.sh --eval ...`; the base image installs `libosmesa6` so the fallback is real |
 | 5-rollout eval takes hours | DP at 100 DDPM steps × composite horizon 1800 (max_steps cap) | pick an atomic task first (`PickPlaceCounterToSink`) to confirm the pipe; or hack DDIM swap in `eval_dp.py` (see §"Performance") |

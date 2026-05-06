@@ -40,7 +40,24 @@ CKPT_DIR="$DP_DIR/checkpoint"
 EVAL_OUT="$DP_DIR/test_outputs"
 HF_CACHE="${HOME}/.cache/huggingface"
 
-CKPT_REL_DEFAULT="diffusion_policy/17.40.09_train_diffusion_transformer_hybrid_pretrain_human300/checkpoints/latest.ckpt"
+CKPT_REL_DIR="diffusion_policy/17.40.09_train_diffusion_transformer_hybrid_pretrain_human300/checkpoints"
+# Auto-detect active ckpt: prefer latest.ckpt > epoch=0500 (leaderboard) > any *.ckpt
+_resolve_ckpt_rel() {
+    local d="$CKPT_DIR/$CKPT_REL_DIR"
+    if [[ -f "$d/latest.ckpt" ]]; then
+        echo "$CKPT_REL_DIR/latest.ckpt"; return
+    fi
+    if [[ -f "$d/epoch=0500-test_mean_score=-1.000.ckpt" ]]; then
+        echo "$CKPT_REL_DIR/epoch=0500-test_mean_score=-1.000.ckpt"; return
+    fi
+    local first
+    first=$(ls -1 "$d"/*.ckpt 2>/dev/null | head -1)
+    if [[ -n "$first" ]]; then
+        echo "$CKPT_REL_DIR/$(basename "$first")"; return
+    fi
+    echo "$CKPT_REL_DIR/latest.ckpt"   # fallback for downstream "missing" error
+}
+CKPT_REL_DEFAULT="$(_resolve_ckpt_rel)"
 CKPT_PATH="${DP_CKPT_PATH:-/dp/checkpoint/$CKPT_REL_DEFAULT}"
 
 MODE=""
@@ -225,7 +242,7 @@ COMMON_ARGS+=( -v "$EVAL_OUT:/dp/test_outputs" )
 [[ -d "$REPO_DIR/robocasa" ]]  && COMMON_ARGS+=( -v "$REPO_DIR:/workspace/robocasa" )
 [[ -d "$REPO_DIR/robosuite" ]] && COMMON_ARGS+=( -v "$REPO_DIR/robosuite:/workspace/robosuite" )
 
-PREAMBLE='mkdir -p /tmp/dp-home /tmp/dp-home/.cache/huggingface'
+PREAMBLE='mkdir -p /tmp/dp-home /tmp/dp-home/.cache/huggingface /tmp/dp-home/tmp/clip'
 
 # ── run modes ─────────────────────────────────────────────────────────────
 case "$MODE" in

@@ -29,7 +29,7 @@ underlying lerobot dataset.
     [0:3]   action.end_effector_position
     [3:6]   action.end_effector_rotation
     [6:7]   action.gripper_close
-    [7:11]  action.base_motion           (zeroed by default; --allow-base-motion overrides)
+    [7:11]  action.base_motion           (passed raw by default; --no-allow-base-motion zeroes)
     [11:12] action.control_mode
 
 Outputs per call (one task, N rollouts):
@@ -104,8 +104,9 @@ def parse_args() -> argparse.Namespace:
                    help="Default: ./test_outputs/dp_<task>/")
     p.add_argument("--smoke-only", action="store_true",
                    help="Load ckpt + build policy, print resolved targets, exit.")
-    p.add_argument("--allow-base-motion", action="store_true", default=False,
-                   help="Pass model's base_motion through raw. Default OFF for atomic/PnP.")
+    p.add_argument("--allow-base-motion", action=argparse.BooleanOptionalAction, default=True,
+                   help="Pass model's predicted base_motion to env (default: True, matches canonical "
+                        "RobomimicImageWrapper). Use --no-allow-base-motion for legacy zeroing behavior.")
     return p.parse_args()
 
 
@@ -142,6 +143,20 @@ def load_workspace_and_policy(ckpt_path: str, output_dir: str, device: str, deps
         cfg["training"]["dataset_dir"] = "/tmp/unused"
 
     cfg = OmegaConf.create(cfg)
+
+    # Sanity: action layout matches cfg's authoritative lerobot_keys order.
+    _cfg_action_keys = OmegaConf.select(cfg, "shape_meta.action.lerobot_keys")
+    if _cfg_action_keys is None:
+        _cfg_action_keys = OmegaConf.select(cfg, "task.shape_meta.action.lerobot_keys")
+    if _cfg_action_keys is not None:
+        _cfg_action_keys = list(_cfg_action_keys)
+        _layout_keys = [k for k, _, _ in DP_ACTION_LAYOUT]
+        assert _cfg_action_keys == _layout_keys, (
+            f"DP_ACTION_LAYOUT mismatch with cfg.shape_meta.action.lerobot_keys.\n"
+            f"  cfg expects:  {_cfg_action_keys}\n"
+            f"  layout has:   {_layout_keys}"
+        )
+
     cls = hydra.utils.get_class(cfg._target_)
     workspace = cls(cfg, output_dir=output_dir)
     workspace.load_payload(payload, exclude_keys=None, include_keys=None)
@@ -154,7 +169,14 @@ def load_workspace_and_policy(ckpt_path: str, output_dir: str, device: str, deps
 
 
 def resolve_obs_keys(cfg, deps: dict) -> dict:
-    """Walk shape_meta.obs (try a few cfg paths) to learn what obs keys DP wants."""
+    """Walk shape_meta.obs (try a few cfg paths) to learn what obs keys DP wants.
+
+    Returns {dp_key: {'type': str, 'shape': list[int], 'lerobot_keys': list[str]|None}}.
+    The `lerobot_keys` field is the cfg's authoritative DP→env key mapping
+    (mirrors `RobomimicImageWrapper.process_obs` at robomimic_image_wrapper.py:80-92).
+    `None` for keys like `lang_emb` that are computed by an encoder rather than
+    pulled from the env obs dict.
+    """
     OmegaConf = deps["OmegaConf"]
     shape_meta = None
     for path in ("policy.shape_meta", "task.shape_meta", "shape_meta"):
@@ -171,42 +193,83 @@ def resolve_obs_keys(cfg, deps: dict) -> dict:
     out = {}
     for k in list(obs_meta.keys()):
         attr = obs_meta[k]
+        lk_raw = attr.get("lerobot_keys", None)
+        if lk_raw is None:
+            lerobot_keys = None
+        else:
+            try:
+                lerobot_keys = [str(x) for x in list(lk_raw)]
+            except Exception:
+                lerobot_keys = None
         out[k] = {
             "shape": [int(x) for x in list(attr.get("shape"))],
             "type":  str(attr.get("type", "low_dim")),
+            "lerobot_keys": lerobot_keys,
         }
     return out
 
 
 # ─── env-obs -> DP-obs conversion ─────────────────────────────────────────
-def find_env_key_for_dp(dp_key: str, env_obs: dict) -> str | None:
-    """Try several namespacing conventions to map a DP shape_meta.obs key to an env key."""
-    if dp_key in env_obs:
+# One-shot logger flag — keeps the resolution-map dump to a single line of stderr
+# the first time `env_obs_to_dp_dict` runs in a process, so deployers can see at
+# a glance whether canonical or fuzzy-fallback resolution is in effect.
+_OBS_RESOLUTION_LOGGED: bool = False
+
+
+def _legacy_fuzzy_match(dp_key: str, env_obs_keys) -> str | None:
+    """Fuzzy heuristic resolver — kept as fallback for cfgs that lack
+    explicit `lerobot_keys`. Preserves the prior behavior verified by
+    earlier tests; do not extend without good reason — the canonical
+    `lerobot_keys[0]` lookup should be the primary path."""
+    if dp_key in env_obs_keys:
         return dp_key
     for prefix in ("video.", "state."):
         cand = f"{prefix}{dp_key}"
-        if cand in env_obs:
+        if cand in env_obs_keys:
             return cand
     cand = f"{dp_key}_image"
-    if cand in env_obs:
+    if cand in env_obs_keys:
         return cand
     # DP cam keys: "robot0_agentview_right_image" -> env "video.robot0_agentview_right"
     if dp_key.endswith("_image"):
         stem = dp_key[: -len("_image")]
         cand = f"video.{stem}"
-        if cand in env_obs:
+        if cand in env_obs_keys:
             return cand
-        if stem in env_obs:
+        if stem in env_obs_keys:
             return stem
     # DP base-relative eef shorthand -> env's *_relative
-    if dp_key in ("robot0_base_to_eef_pos", "eef_pos") and "state.end_effector_position_relative" in env_obs:
+    if dp_key in ("robot0_base_to_eef_pos", "eef_pos") and "state.end_effector_position_relative" in env_obs_keys:
         return "state.end_effector_position_relative"
-    if dp_key in ("robot0_base_to_eef_quat", "eef_quat") and "state.end_effector_rotation_relative" in env_obs:
+    if dp_key in ("robot0_base_to_eef_quat", "eef_quat") and "state.end_effector_rotation_relative" in env_obs_keys:
         return "state.end_effector_rotation_relative"
     # DP gripper qpos -> env state.gripper_qpos
-    if dp_key in ("robot0_gripper_qpos", "gripper_qpos") and "state.gripper_qpos" in env_obs:
+    if dp_key in ("robot0_gripper_qpos", "gripper_qpos") and "state.gripper_qpos" in env_obs_keys:
         return "state.gripper_qpos"
     return None
+
+
+def find_env_key_for_dp(
+    dp_key: str,
+    env_obs,
+    lerobot_keys: list | None = None,
+) -> tuple[str | None, str]:
+    """Resolve the env-side obs key that fulfills a DP shape_meta.obs entry.
+
+    Returns (env_key, source) where source is 'canonical' (cfg lerobot_keys[0]
+    found in env), 'fuzzy' (legacy heuristic was needed), or 'none' (no match).
+
+    `env_obs` may be a dict or any iterable of keys; only set membership is used.
+    """
+    env_obs_keys = env_obs if isinstance(env_obs, (set, frozenset)) else set(env_obs)
+    if lerobot_keys:
+        canonical = lerobot_keys[0]
+        if canonical in env_obs_keys:
+            return canonical, "canonical"
+    fuzzy = _legacy_fuzzy_match(dp_key, env_obs_keys)
+    if fuzzy is not None:
+        return fuzzy, "fuzzy"
+    return None, "none"
 
 
 # Module-level cache for the LangEncoder. Keyed by device.
@@ -215,15 +278,49 @@ _LANG_ENCODER_CACHE: dict = {}
 
 
 def get_lang_encoder(device: str):
-    """Return a cached `robomimic.utils.lang_utils.LangEncoder` instance.
-    This is the EXACT encoder the DP model was trained against (chi2023 fork
-    + robocasa@robocasa branch). It uses CLIPTextModelWithProjection with
-    `text_embeds` pooling and padding='max_length' (77 tokens) — different
-    from a vanilla `CLIPTextModel.pooler_output`."""
-    if device not in _LANG_ENCODER_CACHE:
-        from robomimic.utils.lang_utils import LangEncoder
-        _LANG_ENCODER_CACHE[device] = LangEncoder(device=device)
-    return _LANG_ENCODER_CACHE[device]
+    """Return a cached LangEncoder-equivalent instance (CLIPTextModelWithProjection
+    + AutoTokenizer with padding='max_length', `text_embeds` pooling) — exactly
+    matches `robomimic.utils.lang_utils.LangEncoder`, but bypasses its hardcoded
+    cache_dir (`os.path.expanduser('~/tmp/clip')`) which fails in our container
+    because uid 1000's pw_dir != $HOME. We use the HF cache that's already
+    bind-mounted at $HOME/.cache/huggingface."""
+    import os as _os
+    if device in _LANG_ENCODER_CACHE:
+        return _LANG_ENCODER_CACHE[device]
+
+    import torch  # available now since deps already imported
+    from transformers import CLIPTextModelWithProjection, AutoTokenizer
+
+    _os.environ["TOKENIZERS_PARALLELISM"] = "true"
+    model_variant = "openai/clip-vit-large-patch14"
+    # Use the bind-mounted HF cache rather than ~/tmp/clip
+    cache_dir = _os.path.join(_os.environ.get("HOME", "/tmp/dp-home"),
+                              ".cache", "huggingface", "clip")
+    _os.makedirs(cache_dir, exist_ok=True)
+    text_model = CLIPTextModelWithProjection.from_pretrained(
+        model_variant, cache_dir=cache_dir,
+    ).to(device).eval()
+    tok = AutoTokenizer.from_pretrained(model_variant)
+
+    class _Enc:
+        def __init__(self, model, tokenizer, device):
+            self.model = model; self.tokenizer = tokenizer; self.device = device
+        def get_lang_emb(self, lang):
+            if lang is None:
+                return None
+            with torch.no_grad():
+                tokens = self.tokenizer(
+                    text=lang, add_special_tokens=True, padding="max_length",
+                    return_attention_mask=True, return_tensors="pt",
+                ).to(self.device)
+                emb = self.model(**tokens)["text_embeds"].detach()
+            if isinstance(lang, str):
+                emb = emb[0]
+            return emb
+
+    enc = _Enc(text_model, tok, device)
+    _LANG_ENCODER_CACHE[device] = enc
+    return enc
 
 
 def encode_lang(text: str, dim: int, device: str) -> np.ndarray:
@@ -244,7 +341,10 @@ def encode_lang(text: str, dim: int, device: str) -> np.ndarray:
 
 def env_obs_to_dp_dict(env_obs: dict, obs_keys: dict, lang_emb: np.ndarray) -> dict:
     """One-step env obs -> dict matching DP shape_meta.obs (numpy arrays only)."""
+    global _OBS_RESOLUTION_LOGGED
     out: dict[str, np.ndarray] = {}
+    env_key_set = set(env_obs)
+    resolution_log: list[tuple[str, str | None, str]] = []
     for dp_key, info in obs_keys.items():
         ty = info["type"]
         target_shape = info["shape"]
@@ -254,14 +354,26 @@ def env_obs_to_dp_dict(env_obs: dict, obs_keys: dict, lang_emb: np.ndarray) -> d
             n = min(lang_emb.shape[0], target_shape[0])
             buf[:n] = lang_emb[:n]
             out[dp_key] = buf
+            if not _OBS_RESOLUTION_LOGGED:
+                resolution_log.append((dp_key, "<encoder: lang_emb>", "computed"))
             continue
 
-        env_key = find_env_key_for_dp(dp_key, env_obs)
+        env_key, source = find_env_key_for_dp(
+            dp_key, env_key_set, info.get("lerobot_keys"),
+        )
+        if not _OBS_RESOLUTION_LOGGED:
+            resolution_log.append((dp_key, env_key, source))
         if env_key is None:
             raise KeyError(
                 f"DP wants obs key {dp_key!r} but env has none of "
                 f"{[dp_key, f'video.{dp_key}', f'state.{dp_key}', f'{dp_key}_image']!r}. "
                 f"env keys: {sorted(env_obs)}"
+            )
+        if source == "fuzzy":
+            print(
+                f"  WARNING: obs key {dp_key!r} has no canonical lerobot_keys "
+                f"in cfg (or it wasn't in env); resolved via legacy fuzzy match -> {env_key!r}",
+                file=sys.stderr, flush=True,
             )
 
         if ty == "rgb":
@@ -292,6 +404,16 @@ def env_obs_to_dp_dict(env_obs: dict, obs_keys: dict, lang_emb: np.ndarray) -> d
             print(f"  WARNING: state {dp_key!r} env shape {v.shape[0]} != DP shape {target_shape[0]}",
                   flush=True)
         out[dp_key] = v
+
+    if not _OBS_RESOLUTION_LOGGED:
+        max_dp_w = max((len(k) for k, _, _ in resolution_log), default=0)
+        max_env_w = max((len(str(e)) for _, e, _ in resolution_log), default=0)
+        lines = ["[eval_dp] DP -> env obs key resolution:"]
+        for dp_k, env_k, src in resolution_log:
+            lines.append(f"  {dp_k:<{max_dp_w}}  ->  {str(env_k):<{max_env_w}}  [{src}]")
+        print("\n".join(lines), file=sys.stderr, flush=True)
+        _OBS_RESOLUTION_LOGGED = True
+
     return out
 
 
