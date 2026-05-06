@@ -271,18 +271,33 @@ same ballpark for any task in `atomic_seen` / `composite_seen` /
 
 ### Measured on this repo
 
-Verified end-to-end run from the in-tree `dp_docker/` (RTX 3080 10 GB,
-2026-05-07):
+Verified end-to-end run from the in-tree `dp_docker/` on `PickPlaceCounterToSink`,
+split=pretrain, RTX 3080 10 GB, 2026-05-07:
 
-| Task | Split | Ckpt | Rollouts | Successes | mean_lat | Notes |
-|---|---|---|---|---|---|---|
-| `PickPlaceCounterToSink` | pretrain | `latest.ckpt` (sha `fdae0060…`) | 5 | **0/5 = 0%** | 705.6 ms | Originally archived to `test_outputs/latest_ckpt_run/`. mp4 = h264 768×512 @ 20fps, 600 frames per rollout. |
-| `PickPlaceCounterToSink` | pretrain | **`epoch=0500-test_mean_score=-1.000.ckpt`** (sha `e19011f1…`, leaderboard-aligned) | 5 | **0/5 = 0%** | 762.4 ms | Same SR as `latest.ckpt`. Per-task DP number not in paper; both consistent with the 15.7% Atomic-Seen average. mp4s + `dp_PickPlaceCounterToSink_summary.json` at `test_outputs/`. |
+**Pre-fix runs (commit `0b40f0f`, before the four alignment bugs were caught):**
+
+| Ckpt | n | SR | mean_lat | Archived at |
+|---|---|---|---|---|
+| `latest.ckpt` (sha `fdae0060…`) | 5 | 0/5 = 0% | 705.6 ms | `test_outputs/latest_ckpt_run/` |
+| `epoch=0500-test_mean_score=-1.000.ckpt` (sha `e19011f1…`, leaderboard) | 5 | 0/5 = 0% | 762.4 ms | `test_outputs/e500_basemotionzero/` |
+
+**Post-fix runs (commit `21d637f`, after all four pitfalls in [`EVAL_PITFALLS.md`](EVAL_PITFALLS.md) were fixed):**
+
+| Eval window | Seeds | n | SR | mean_lat | Notes |
+|---|---|---|---|---|---|
+| Phase 6 (initial 5-rollout) | 0–4 | 5 | 0/5 | 706 ms | archived at `test_outputs/phase6_seed0to4/` |
+| Phase 7b (extended) | 5–19 | 15 | **1/15** | 689 ms | seed=6 ✓ at step 161, mp4 at `test_outputs/dp_PickPlaceCounterToSink_seed6_success1.mp4` |
+| **combined** | **0–19** | **20** | **1/20 = 5%** | — | 95% binomial CI **[0.13%, 25%]** -- includes paper's **15.7%** atomic-seen average. Paper-consistent. |
+
+The single success (seed=6, 161 sim steps = 8.05 s of simulated time, mp4
+shorter than the 30-s max-steps cap) is the proof point: with all four
+fixes in place the wrapper *can* solve the task; 0/5 on n=5 was just
+binomial noise (P(0/5 \| p=0.157) ≈ 0.42, see §"Eval correctness verification").
 
 Compare to `multitask` GR00T-N1.5 on the same task on the same machine:
-3/5 = 60% (`README.md §"Verified results (GR00T-N1.5)"`). The gap is
-roughly the paper's 43.0 / 15.7 = 2.7× spread, plus PnPCounterToSink
-appearing to be one of the easier atomic tasks for GR00T.
+3/5 = 60% (`../README.md §"Verified results (GR00T-N1.5)"`). The
+GR00T/DP gap is roughly the paper's 43.0 / 15.7 = 2.7× Atomic-Seen
+spread.
 
 ### Eval correctness verification
 
@@ -327,6 +342,11 @@ The runtime assertion at `eval_dp.py:153` catches future
 `DP_ACTION_LAYOUT` regression by comparing it to the loaded ckpt's
 `cfg.shape_meta.action.lerobot_keys` at startup.
 
+**Full per-bug postmortem with symptom / root-cause / fix / verify
+breakdown, the discovery process, and a pre-eval checklist** lives at
+[`EVAL_PITFALLS.md`](EVAL_PITFALLS.md). Read that before patching the
+wrapper or porting this pattern to another VLA model.
+
 ## What's NOT in this image
 
 | Not baked | Why | How it gets onto the host |
@@ -350,7 +370,7 @@ The runtime assertion at `eval_dp.py:153` catches future
 | `ModuleNotFoundError: No module named 'robomimic.X'` (any other class) | robomimic version skew | as above — the `robocasa` branch is canonical for this checkpoint |
 | First eval slow / hangs at "loading CLIP" / network warning | `transformers.CLIPTextModel.from_pretrained('openai/clip-vit-large-patch14')` runs once on the first eval (~600 MB) and persists via the host HF cache bind-mount (`~/.cache/huggingface`). | Wait once (~30 s on a fast link). Subsequent runs hit the cache. The wrapper also keeps a module-level cache so additional rollouts in the same process skip the GPU load entirely. |
 | `0/5 success on PnPCounterToSink` | Expected for the multitask DP checkpoint — paper reports **15.7% atomic-seen avg** (Table 1, §4.1) and there is no per-task PnP figure released. | This is on-distribution behavior. No target-FT'd DP recipe was released. Try `--num-rollouts 30` per task to get a meaningful per-task estimate, or run the full `atomic_seen` soup via the upstream `eval_robocasa.py` from `--shell`. |
-| `0/5 SR with consistent failure pattern across seeds` | Stronger version of the above. Originally we tracked this to four wrapper bugs (action layout / lang encoder / task text / base motion) all since fixed; see §"Eval correctness verification". The runtime assertion at `eval_dp.py:153` will fire on `DP_ACTION_LAYOUT` regression. | If the assertion fires, your wrapper has drifted from `cfg.shape_meta.action.lerobot_keys` — restore the layout. If it doesn't fire, your 0/5 is paper-consistent statistical noise (P(0/5\|p=0.157) ≈ 0.42); run n ≥ 20 for tighter signal. |
+| `0/5 SR with consistent failure pattern across seeds` | Stronger version of the above. Originally we tracked this to four wrapper bugs (action layout / lang encoder / task text / base motion) all since fixed; see §"Eval correctness verification". The runtime assertion at `eval_dp.py:153` will fire on `DP_ACTION_LAYOUT` regression. | If the assertion fires, your wrapper has drifted from `cfg.shape_meta.action.lerobot_keys` — restore the layout. If it doesn't fire, your 0/5 is paper-consistent statistical noise (P(0/5\|p=0.157) ≈ 0.42); run n ≥ 20 for tighter signal. **For full per-bug postmortem with symptom/root-cause/fix/verify breakdown, see [`EVAL_PITFALLS.md`](EVAL_PITFALLS.md).** |
 | CUDA OOM on RTX 3060 (12 GB) | `--num-envs > 1` is tight at 12 GB once CLIP + DP-Hybrid + ResNet × 3 cams + MuJoCo render are co-resident | use `--num-envs 1` (default); lower `cfg.policy.num_inference_steps` if needed (will hurt SR); or force CLIP to CPU by exporting `CUDA_VISIBLE_DEVICES=-1` only during the lang-emb call (custom patch) |
 | EGL render fails | EGL probe fails inside container | run with `MUJOCO_GL=osmesa ./run.sh --eval ...`; the base image installs `libosmesa6` so the fallback is real |
 | 5-rollout eval takes hours | DP at 100 DDPM steps × composite horizon 1800 (max_steps cap) | pick an atomic task first (`PickPlaceCounterToSink`) to confirm the pipe; or hack DDIM swap in `eval_dp.py` (see §"Performance") |
@@ -362,8 +382,10 @@ diffusion_policy; ..."` verifies the import chain.
 
 ## Cross-references
 
+- [`EVAL_PITFALLS.md`](EVAL_PITFALLS.md) — postmortem of the four alignment bugs in `eval_dp.py` and the numerical-parity discovery process
 - [`../README.md`](../README.md) — top-level fork README; sim quickstart, `bigenlight/robocasa-eval` base image
 - [`../groot_docker_n1.5/README.md`](../groot_docker_n1.5/README.md) — sibling: GR00T-N1.5 HTTP eval workflow (companion image pattern)
+- [`../GR00T_EVAL_TIPS.md`](../GR00T_EVAL_TIPS.md) — sibling postmortem for the GR00T-N1.5 wrapper
 - [`../GR00T_CHECKPOINTS.md`](../GR00T_CHECKPOINTS.md) — context on the broader RoboCasa365 checkpoint catalog
 - [`../DOCKER.md`](../DOCKER.md) — design rationale shared by all eval containers in this repo
 - Fork: <https://github.com/robocasa-benchmark/diffusion_policy>
